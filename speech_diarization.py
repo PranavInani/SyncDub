@@ -67,8 +67,6 @@ class SpeakerDiarizer:
             speakers = self._reencode_speakers(speakers)
             print(f"Diarization completed in {time.time() - start_time:.1f}s")
             print(f"Found {len(set(s['speaker'] for s in speakers))} speakers")
-            logger.info(f"Diarization completed in {time.time() - start_time:.1f}s")
-            logger.info(f"Found {len(set(s['speaker'] for s in speakers))} speakers")
             
             return speakers
         except Exception as e:

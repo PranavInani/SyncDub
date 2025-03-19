@@ -9,3 +9,6 @@ pydub
 ffmpeg-python
 dotenv
 spleeter
+deep_translator
+langchain
+langchain-groq
