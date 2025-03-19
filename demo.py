@@ -15,6 +15,7 @@ from speech_recognition import SpeechRecognizer
 from speech_diarization import SpeakerDiarizer
 from translate import translate_text
 from text_to_speech import generate_speech, adjust_speech_timing, apply_voice_effects
+from merge_audio_video import create_dubbed_video
 
 def create_directories(dirs):
     """Create necessary directories"""
@@ -99,6 +100,12 @@ def main():
                 speaker_id = int(match.group(1))
                 gender = input(f"Select voice gender for Speaker {speaker_id+1} (m/f): ").lower()
                 voice_config[speaker_id] = "female" if gender.startswith("f") else "male"
+            else:
+                # Handle case where regex pattern doesn't match
+                logger.warning(f"Could not extract speaker ID from {speaker}, using default voice")
+                # Use a default assignment based on speaker string to avoid getting stuck
+                speaker_num = hash(speaker) % 2  # Simple way to get consistent number from string
+                voice_config[speaker] = "female" if speaker_num == 1 else "male"
     
     # Step 7: Generate speech in target language
     logger.info("Generating speech...")
@@ -117,12 +124,33 @@ def main():
     # Step 9: Final output
     logger.info("Translation and dubbing completed successfully!")
     logger.info(f"Processed {len(output_files)} audio segments")
-    logger.info("The dubbed audio segments are in the 'audio2/audio' directory")
     
-    # Suggest next steps
-    logger.info("\nNext steps:")
-    logger.info("1. You can now merge these audio segments with the original video")
-    logger.info("2. Use a tool like ffmpeg to combine the segments with the video")
+    # Step 10: Create final dubbed video
+    create_final_video = input("Create final dubbed video? (y/n): ").lower() == 'y'
+    if create_final_video:
+        # Ask for output filename
+        video_basename = os.path.basename(video_path)
+        video_name = os.path.splitext(video_basename)[0]
+        default_output = f"{video_name}_dubbed.mp4"
+        
+        output_name = input(f"Output filename [default: {default_output}]: ")
+        output_name = output_name.strip() if output_name.strip() else default_output
+        
+        # Create output directory
+        os.makedirs("hindi_dubbing_output", exist_ok=True)
+        output_path = os.path.join("hindi_dubbing_output", output_name)
+        
+        # Create the dubbed video
+        logger.info("Creating final dubbed video...")
+        result_path = create_dubbed_video(video_path, translated_segments, output_path)
+        
+        if result_path and os.path.exists(result_path):
+            logger.info(f"Final dubbed video created: {result_path}")
+        else:
+            logger.error("Failed to create final dubbed video")
+    else:
+        logger.info("Skipping final video creation")
+        logger.info("The dubbed audio segments are in the 'audio2/audio' directory")
 
 if __name__ == "__main__":
     main()

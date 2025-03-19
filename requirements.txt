@@ -12,3 +12,4 @@ spleeter
 deep_translator
 langchain
 langchain-groq
+python-dotenv
