@@ -72,6 +72,7 @@ def adjust_audio_duration(audio_segment, target_duration):
 class XTTSModelLoader:
     _instance = None
     model = None
+    api_model = None
     
     @classmethod
     def get_model(cls):
@@ -87,9 +88,11 @@ class XTTSModelLoader:
                 from TTS.tts.configs.xtts_config import XttsConfig
                 from TTS.tts.models.xtts import Xtts
                 
-                # Get the model info first using the API
-                api_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-                model_path = api_model.model_path
+                # Get the model info first using the API - store it as class variable
+                if cls.api_model is None:
+                    cls.api_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+                
+                model_path = cls.api_model.model_path
                 config_path = os.path.join(os.path.dirname(model_path), "config.json")
                 vocab_path = os.path.join(os.path.dirname(model_path), "vocab.json")
                 
