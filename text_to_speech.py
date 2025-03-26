@@ -7,6 +7,7 @@ import torch
 from pydub import AudioSegment
 from pathlib import Path
 import subprocess
+import torchaudio
 
 
 # Set up basic logging
@@ -77,14 +78,30 @@ class XTTSModelLoader:
         """Get or initialize the XTTS model"""
         if cls.model is None:
             try:
-                from TTS.api import TTS
-                
                 # Determine device
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 logger.info(f"Loading XTTS model on {device}...")
                 
-                # Load the model
-                cls.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+                # Using the TTS API for convenience in loading the model
+                from TTS.api import TTS
+                from TTS.tts.configs.xtts_config import XttsConfig
+                from TTS.tts.models.xtts import Xtts
+                
+                # Get the model info first using the API
+                api_model = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+                model_path = api_model.model_path
+                config_path = os.path.join(os.path.dirname(model_path), "config.json")
+                vocab_path = os.path.join(os.path.dirname(model_path), "vocab.json")
+                
+                # Load the model directly like in the sample code
+                config = XttsConfig()
+                config.load_json(config_path)
+                cls.model = Xtts.init_from_config(config)
+                cls.model.load_checkpoint(config, checkpoint_path=model_path, vocab_path=vocab_path, use_deepspeed=False)
+                
+                if device == "cuda":
+                    cls.model.cuda()
+                
                 logger.info("XTTS model loaded successfully")
             except Exception as e:
                 logger.error(f"Error loading XTTS model: {e}")
@@ -173,58 +190,82 @@ def create_segmented_xtts(text, reference_audio, language, output_path, target_d
     if tts_model is None:
         raise RuntimeError("XTTS model could not be loaded. Ensure TTS is installed.")
     
-    # print(reference_audio)
-
     # Verify reference audio exists
     if not os.path.exists(reference_audio):
         raise FileNotFoundError(f"Reference audio file not found: {reference_audio}")
     
-    # Generate speech
+    # Default speed factor is 1.0 (no adjustment)
+    speed_factor = 1.0
+    
+    # Get conditioning latents from reference audio
+    logger.info(f"Extracting voice characteristics from reference: {os.path.basename(reference_audio)}")
+    gpt_cond_latent, speaker_embedding = tts_model.get_conditioning_latents(
+        audio_path=reference_audio, 
+        gpt_cond_len=tts_model.config.gpt_cond_len,
+        max_ref_length=tts_model.config.max_ref_len, 
+        sound_norm_refs=tts_model.config.sound_norm_refs
+    )
+    
+    # Calculate speed adjustment if target_duration is provided
+    if target_duration is not None:
+        # Generate initial audio (without saving) to check duration
+        logger.info(f"Estimating speech duration...")
+        initial_output = tts_model.inference(
+            text=text,
+            language=language,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+            temperature=tts_model.config.temperature,
+            length_penalty=tts_model.config.length_penalty,
+            repetition_penalty=tts_model.config.repetition_penalty,
+            top_k=tts_model.config.top_k,
+            top_p=tts_model.config.top_p,
+        )
+        
+        # Calculate the duration of generated speech
+        estimated_duration = len(initial_output["wav"]) / 24000  # XTTS uses 24kHz sample rate
+        
+        if abs(estimated_duration - target_duration) > 0.1:  # 100ms threshold
+            # Calculate speed factor - inverse of duration ratio
+            speed_factor = estimated_duration / target_duration
+            speed_factor = min(max(speed_factor, 0.7), 1.5)  # Keep in reasonable range
+            logger.info(f"  Adjusting timing: {estimated_duration:.2f}s → {target_duration:.2f}s (speed factor: {speed_factor:.2f})")
+    
+    # Generate speech with the proper speed factor using the direct speed parameter
+    logger.info(f"Generating XTTS speech using reference: {os.path.basename(reference_audio)}")
+    
+    # Run inference with adjusted parameters
+    output = tts_model.inference(
+        text=text,
+        language=language,
+        gpt_cond_latent=gpt_cond_latent,
+        speaker_embedding=speaker_embedding,
+        temperature=tts_model.config.temperature,
+        length_penalty=tts_model.config.length_penalty,
+        repetition_penalty=tts_model.config.repetition_penalty,
+        top_k=tts_model.config.top_k,
+        top_p=tts_model.config.top_p,
+        speed=speed_factor,  # Use the direct speed parameter
+    )
+    
+    # Convert the output to proper audio format and save
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
     temp_filename = temp_file.name
     temp_file.close()
     
-    logger.info(f"Generating XTTS speech using reference: {os.path.basename(reference_audio)}")
-    tts_model.tts_to_file(
-        text=text,
-        speaker_wav=reference_audio,
-        language=language,
-        file_path=temp_filename
-    )
+    # Save using torchaudio for better compatibility
+    wav_tensor = torch.tensor(output["wav"]).unsqueeze(0)
+    torchaudio.save(temp_filename, wav_tensor, 24000)  # XTTS uses 24kHz sample rate
     
-    # Load generated audio
+    # Load the audio file with pydub for further processing
     audio = AudioSegment.from_file(temp_filename)
     
-    # Apply duration adjustment if needed
+    # Fine tune if needed - keep this as a fallback since extreme speed values can cause artifacts
     if target_duration is not None:
         current_duration = len(audio) / 1000  # ms to seconds
-        
-        if abs(current_duration - target_duration) > 0.1:  # 100ms threshold
-            # Calculate speed factor - inverse of duration ratio
-            speed_factor = current_duration / target_duration
-            speed_factor = min(max(speed_factor, 0.7), 1.5)  # Keep in reasonable range
-            
-            logger.info(f"  Adjusting timing: {current_duration:.2f}s → {target_duration:.2f}s (speed factor: {speed_factor:.2f})")
-            
-            # Remove the temporary file
-            os.unlink(temp_filename)
-            
-            # Regenerate audio with adjusted speed
-            tts_model.tts_to_file(
-                text=text,
-                speaker_wav=reference_audio,
-                language=language,
-                file_path=temp_filename,
-                speed=speed_factor
-            )
-            
-            # Reload the audio
-            audio = AudioSegment.from_file(temp_filename)
-            
-            # Fine tune if needed
-            new_duration = len(audio) / 1000
-            if abs(new_duration - target_duration) > 0.1:
-                audio = adjust_audio_duration(audio, target_duration)
+        if abs(current_duration - target_duration) > 0.1:
+            logger.info(f"  Fine-tuning duration with post-processing: {current_duration:.2f}s → {target_duration:.2f}s")
+            audio = adjust_audio_duration(audio, target_duration)
     
     # Save the final audio
     audio.export(output_path, format="wav")
