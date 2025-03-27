@@ -63,6 +63,9 @@ def process_video(video_input, youtube_url, target_language, tts_choice, max_spe
     progress(0, desc="Initializing")
     status_updates = []
     
+    # Convert language name to code
+    target_lang_code = LANGUAGE_OPTIONS.get(target_language, "en")
+    
     def update_status(message):
         status_updates.append(message)
         return "\n".join(status_updates)
@@ -125,16 +128,16 @@ def process_video(video_input, youtube_url, target_language, tts_choice, max_spe
             reference_files = {}
         
         # Step 5: Translate the segments
-        update_status(f"Translating to {target_language}...")
+        update_status(f"Translating to {target_language} ({target_lang_code})...")
         progress(0.7, desc="Translating")
         translated_segments = translate_text(
             final_segments, 
-            target_lang=target_language,
+            target_lang=target_lang_code,  # Use the code here
             translation_method="batch"
         )
         
         # Create subtitles for preview
-        subtitle_file = f"temp/{os.path.basename(video_path).split('.')[0]}_{target_language}.srt"
+        subtitle_file = f"temp/{os.path.basename(video_path).split('.')[0]}_{target_lang_code}.srt"
         generate_srt_subtitles(translated_segments, output_file=subtitle_file)
         update_status(f"Generated subtitle file: {subtitle_file}")
         
@@ -144,7 +147,7 @@ def process_video(video_input, youtube_url, target_language, tts_choice, max_spe
             "video_path": video_path,
             "bg_audio_path": bg_audio_path,
             "translated_segments": translated_segments,
-            "target_language": target_language,
+            "target_language": target_lang_code,  # Store the code, not the display name
             "use_voice_cloning": tts_choice == "Voice cloning (XTTS)",
             "reference_files": reference_files,
             "unique_speakers": sorted(list(unique_speakers)),
@@ -334,13 +337,8 @@ with gr.Blocks(title="SyncDub - AI Video Dubbing") as app:
                     output_video = gr.Video(label="Dubbed Video")
                     subtitle_download = gr.File(label="Download Subtitles (SRT)")
     
-    # Connect events
+    # Connect events - fixed version without _js parameter
     process_btn.click(
-        fn=lambda lang, *args: LANGUAGE_OPTIONS[lang],
-        inputs=[target_language],
-        outputs=[],
-        _js="(lang) => {window.selected_language = lang; return lang;}"
-    ).then(
         fn=process_video,
         inputs=[video_input, youtube_url, target_language, tts_choice, max_speakers],
         outputs=[transcript_output, status_output]
@@ -372,5 +370,5 @@ if __name__ == "__main__":
         print("Warning: HUGGINGFACE_TOKEN not found in .env file")
         print("Speaker diarization may not work properly")
     
-    # Launch the Gradio app
-    app.launch(share=True)
+    # Launch the Gradio app with compatibility settings
+    app.launch(share=True, server_name="0.0.0.0")
