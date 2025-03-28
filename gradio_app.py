@@ -6,7 +6,7 @@ import gradio as gr
 from dotenv import load_dotenv
 import uuid
 
-# Add the current directory to path
+# Add current directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -124,7 +124,7 @@ def create_interface():
                 media = gr.Textbox(label="Video URL/Path")
                 upload = gr.File(label="Or Upload Video", file_types=["video"])
                 lang = gr.Dropdown(
-                    choices=["en", "es", "hi" ,"fr", "de", "it", "ja", "ko", "pt", "ru", "zh"],
+                    choices=["en", "hi" ,"es", "fr", "de", "it", "ja", "ko", "pt", "ru", "zh"],
                     label="Target Language",
                     value="en"
                 )
@@ -173,11 +173,12 @@ def create_interface():
             [video, subs, msg]
         )
         
-        # Timer with correct parameter for latest Gradio versions
-        timer = gr.Timer(
-            interval=1,  # Works with newer versions
-            fn=lambda: processing_status.get(session_id.value, {}).get("status", "Ready"),
-            outputs=status
+        # Status updates using Gradio 5.x compatible approach
+        dummy = gr.Textbox(visible=False)
+        dummy.change(
+            lambda: processing_status.get(session_id.value, {}).get("status", "Ready"),
+            outputs=status,
+            every=1
         )
 
     return app
