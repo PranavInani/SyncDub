@@ -256,18 +256,20 @@ if __name__ == "__main__":
         is_colab = True
     except ImportError:
         is_colab = False
-        
-    # Use more flexible port configuration
-    if is_colab:
-        # For Google Colab
-        interface.launch(share=True)
-    else:
-        # For local or Kaggle environments, try to be more flexible with ports
-        import os
-        port = int(os.environ.get("PORT", 7860))
-        try:
-            # Allow Gradio to find any available port if specified one is busy
-            interface.launch(server_name="0.0.0.0", server_port=port, share=True)
-        except OSError:
-            # If specified port is busy, let Gradio find an available one
+    
+    # The simplest robust solution: let Gradio find an available port automatically
+    # This works in most environments (local, Kaggle, etc.)
+    try:
+        if is_colab:
+            # For Google Colab, share is important
+            interface.launch(share=True)
+        else:
+            # For other environments (Kaggle, local), don't specify a port
+            # Let Gradio automatically find an available one
             interface.launch(server_name="0.0.0.0", share=True)
+    except Exception as e:
+        # If there's still an error, report it clearly
+        print(f"Error launching Gradio interface: {str(e)}")
+        print("Trying alternate launch method...")
+        # Fallback to the most basic launch method
+        interface.launch()
