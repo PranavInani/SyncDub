@@ -249,4 +249,7 @@ def create_interface():
 
 if __name__ == "__main__":
     interface = create_interface()
-    interface.launch(server_name="0.0.0.0", server_port=7860)
+    # For Kaggle environments, use their specified port
+    import os
+    port = int(os.environ.get("PORT", 7860))
+    interface.launch(server_name="0.0.0.0", server_port=port)
