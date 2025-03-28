@@ -41,7 +41,7 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
     try:
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
         if not hf_token:
-            return {"error": "Missing HUGGINGFACE_TOKEN in .env file"}
+            return {"error": "Missing HUGGINGFACE_TOKEN"}
         
         processing_status[session_id] = {"status": "Initializing components", "progress": 0}
         
@@ -129,16 +129,31 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         }
 
 def create_interface():
-    with gr.Blocks(title="SyncDub", theme=gr.themes.Soft(), css=".loading {animation: spin 2s linear infinite;}") as app:
+    css = """
+    .loading {
+        display: none;
+        text-align: center;
+        margin: 10px;
+    }
+    .loading svg {
+        animation: spin 2s linear infinite;
+    }
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+    """
+
+    with gr.Blocks(title="SyncDub", theme=gr.themes.Soft(), css=css) as app:
         gr.Markdown("# SyncDub - Video Translation & Dubbing")
         session_id = gr.State(create_session_id)
         
         with gr.Row():
             with gr.Column():
                 media = gr.Textbox(label="Video URL or File Path")
-                upload = gr.File(label="Upload Video", file_types=["video"])
+                upload = gr.File(label="Or Upload Video", file_types=["video"], type="filepath")
                 lang = gr.Dropdown(
-                    choices=["en","hi", "es", "fr", "de", "it", "ja", "ko", "pt", "ru", "zh"],
+                    choices=["en", "es", "fr", "de", "it", "ja", "ko", "pt", "ru", "zh"],
                     label="Target Language",
                     value="en"
                 )
@@ -147,14 +162,13 @@ def create_interface():
                     label="TTS Method",
                     value="Simple dubbing (Edge TTS)"
                 )
-                speakers = gr.Slider(1, 8, value=1, step=1, label="Maximum Speakers")
+                speakers = gr.Slider(1, 8, value=1, step=1, label="Maximum Speakers (0=auto)")
                 inputs = gr.Column()
-                btn = gr.Button("Start Processing", variant="primary", elem_id="process-btn")
+                btn = gr.Button("Start Processing", variant="primary")
                 status = gr.Textbox(label="Status", value="Ready", interactive=False)
-                loading = gr.HTML("""<div class="loading" style="display: none; text-align: center">
-                                    <svg width="42" height="42" viewBox="0 0 42 42">
-                                        <circle cx="21" cy="21" r="15" stroke="gray" stroke-width="4" fill="none" stroke-dasharray="25 10"/>
-                                    </svg></div>""")
+                loading = gr.HTML("""<div class="loading"><svg width="42" height="42" viewBox="0 0 42 42">
+                                  <circle cx="21" cy="21" r="15" stroke="#4a90e2" stroke-width="4" fill="none" stroke-dasharray="25 10"/>
+                                  </svg></div>""")
             
             with gr.Column():
                 video = gr.Video(label="Processed Video")
@@ -167,7 +181,7 @@ def create_interface():
                 if tts_method == "Simple dubbing (Edge TTS)":
                     components.append(gr.Radio(
                         ["male", "female"], 
-                        label=f"Speaker {i+1} Gender",
+                        label=f"Speaker {i+1} Voice",
                         value="female"
                     ))
                 else:
@@ -177,14 +191,29 @@ def create_interface():
                     ))
             return components
 
-        tts.change(update_inputs, [tts, speakers], inputs)
-        speakers.change(update_inputs, [tts, speakers], inputs)
+        tts.change(
+            update_inputs,
+            [tts, speakers],
+            inputs
+        )
+        
+        speakers.change(
+            update_inputs,
+            [tts, speakers],
+            inputs
+        )
 
         def wrapper(media_url, media_file, lang, tts, spk, *inputs):
             session_id.value = create_session_id()
-            source = media_file or media_url
-            config = {str(i): val for i, val in enumerate(inputs) if val}
-            return process_video(source, lang, tts, spk, config, session_id.value)
+            source = media_file if media_file else media_url
+            config = {}
+            for i, val in enumerate(inputs):
+                if val:  # Only add if value exists
+                    if isinstance(val, dict):  # File input
+                        config[str(i)] = val.get("name", "")
+                    else:  # Radio input
+                        config[str(i)] = val
+            return process_video(source, lang, tts, str(spk), config, session_id.value)
         
         btn.click(
             wrapper,
@@ -194,27 +223,30 @@ def create_interface():
         
         # Status updates
         def update_status(session_id):
-            status = processing_status.get(session_id, {}).get("status", "Ready")
-            return status
+            current_status = processing_status.get(session_id, {}).get("status", "Ready")
+            return current_status
         
-        app.load(
-            fn=None,
-            inputs=None,
-            outputs=None,
-            _js="""
-            () => {
-                setInterval(() => {
-                    const statusBox = document.querySelector('#status textarea');
-                    const loading = document.querySelector('.loading');
-                    if (statusBox.value.includes('Processing') || statusBox.value.includes('Initializing')) {
-                        loading.style.display = 'block';
-                    } else {
-                        loading.style.display = 'none';
-                    }
-                    document.querySelector('#process-btn').click();
-                }, 1000);
-            }
-            """
+        # Loading animation control
+        def toggle_loading(status):
+            show = "Processing" in status or "Initializing" in status
+            return gr.HTML.update(visible=show)
+        
+        # Create a dummy component to trigger updates
+        dummy = gr.Textbox(visible=False)
+        
+        # Set up status updates
+        status.change(
+            lambda: update_status(session_id.value),
+            None,
+            status,
+            every=1
+        )
+        
+        # Control loading animation
+        status.change(
+            toggle_loading,
+            status,
+            loading
         )
 
     return app
