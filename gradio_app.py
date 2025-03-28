@@ -249,7 +249,25 @@ def create_interface():
 
 if __name__ == "__main__":
     interface = create_interface()
-    # For Kaggle environments, use their specified port
-    import os
-    port = int(os.environ.get("PORT", 7860))
-    interface.launch(server_name="0.0.0.0", server_port=port)
+    
+    # Check if running in Colab or Kaggle
+    try:
+        import google.colab
+        is_colab = True
+    except ImportError:
+        is_colab = False
+        
+    # Use more flexible port configuration
+    if is_colab:
+        # For Google Colab
+        interface.launch(share=True)
+    else:
+        # For local or Kaggle environments, try to be more flexible with ports
+        import os
+        port = int(os.environ.get("PORT", 7860))
+        try:
+            # Allow Gradio to find any available port if specified one is busy
+            interface.launch(server_name="0.0.0.0", server_port=port, share=True)
+        except OSError:
+            # If specified port is busy, let Gradio find an available one
+            interface.launch(server_name="0.0.0.0", share=True)
