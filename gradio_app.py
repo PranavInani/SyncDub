@@ -1,18 +1,18 @@
 import os
 import sys
 import logging
+import tempfile
 import re
 import gradio as gr
 from dotenv import load_dotenv
-import uuid
-import time
+import threading
 
-# Add current directory to path
+# Add the current directory to path to help with imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-# Import modules
+# Import the required modules
 from media_ingestion import MediaIngester
 from speech_recognition import SpeechRecognizer
 from speech_diarization import SpeakerDiarizer
@@ -20,256 +20,482 @@ from translate import translate_text, generate_srt_subtitles
 from text_to_speech import generate_tts
 from audio_to_video import create_video_with_mixed_audio
 
-# Configuration
+# Load environment variables
 load_dotenv()
+
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Create directories
+# Create necessary directories
 os.makedirs("temp", exist_ok=True)
 os.makedirs("audio", exist_ok=True)
 os.makedirs("audio2", exist_ok=True)
 os.makedirs("reference_audio", exist_ok=True)
 
-# Global state
+# Global variables for process tracking
 processing_status = {}
 
 def create_session_id():
+    """Create a unique session ID for tracking progress"""
+    import uuid
     return str(uuid.uuid4())[:8]
 
-def process_video(media_source, target_language, tts_choice, max_speakers, speaker_config, session_id, progress=gr.Progress()):
+def process_video(media_source, target_language, tts_choice, max_speakers, speaker_genders, session_id, progress=gr.Progress()):
+    """Main processing function that handles the complete pipeline"""
+    global processing_status
+    processing_status[session_id] = {"status": "Starting", "progress": 0}
+    
     try:
+        # Get API tokens
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
+        
         if not hf_token:
-            return {"error": "Missing HUGGINGFACE_TOKEN"}
+            return {"error": True, "message": "Error: HUGGINGFACE_TOKEN not found in .env file"}
         
-        processing_status[session_id] = {"status": "Initializing components", "progress": 0}
+        # Determine if input is URL or file
+        is_url = media_source.startswith(("http://", "https://"))
         
-        progress(0.05, desc="Initializing")
-        ingester = MediaIngester("temp")
-        recognizer = SpeechRecognizer("base")
-        diarizer = SpeakerDiarizer(hf_token)
-
-        progress(0.1, desc="Processing media")
+        # Initialize components
+        progress(0.05, desc="Initializing components")
+        processing_status[session_id] = {"status": "Initializing components", "progress": 0.05}
+        
+        ingester = MediaIngester(output_dir="temp")
+        recognizer = SpeechRecognizer(model_size="base")
+        diarizer = SpeakerDiarizer(hf_token=hf_token)
+        
+        # Step 1: Process input and extract audio
+        progress(0.1, desc="Processing media source")
+        processing_status[session_id] = {"status": "Processing media source", "progress": 0.1}
+        
         video_path = ingester.process_input(media_source)
         audio_path = ingester.extract_audio(video_path)
-
-        progress(0.15, desc="Cleaning audio")
-        clean_audio, bg_audio = ingester.separate_audio_sources(audio_path)
-
-        progress(0.2, desc="Transcribing")
-        segments = recognizer.transcribe(clean_audio)
-
+        
+        progress(0.15, desc="Separating audio sources")
+        processing_status[session_id] = {"status": "Separating audio sources", "progress": 0.15}
+        
+        clean_audio_path, bg_audio_path = ingester.separate_audio_sources(audio_path)
+        
+        # Step 2: Perform speech recognition
+        progress(0.2, desc="Transcribing audio")
+        processing_status[session_id] = {"status": "Transcribing audio", "progress": 0.2}
+        
+        segments = recognizer.transcribe(clean_audio_path)
+        
+        # Step 3: Perform speaker diarization
         progress(0.3, desc="Identifying speakers")
-        max_spk = int(max_speakers) if max_speakers.strip() else None
-        speakers = diarizer.diarize(clean_audio, max_spk)
-
-        progress(0.4, desc="Assigning speakers")
+        processing_status[session_id] = {"status": "Identifying speakers", "progress": 0.3}
+        
+        # Convert max_speakers to int or None
+        max_speakers_val = int(max_speakers) if max_speakers and max_speakers.strip() else None
+        
+        # Diarize audio to identify speakers
+        speakers = diarizer.diarize(clean_audio_path, max_speakers=max_speakers_val)
+        
+        # Step 4: Assign speakers to segments
+        progress(0.4, desc="Assigning speakers to segments")
+        processing_status[session_id] = {"status": "Assigning speakers to segments", "progress": 0.4}
+        
         final_segments = diarizer.assign_speakers_to_segments(segments, speakers)
-
-        progress(0.5, desc="Translating")
-        translated = translate_text(final_segments, target_language)
+        
+        # Step 5: Translate the segments
+        progress(0.5, desc=f"Translating to {target_language}")
+        processing_status[session_id] = {"status": f"Translating to {target_language}", "progress": 0.5}
+        
+        # Validate target language
+        valid_languages = ["en", "es", "fr", "de", "it", "ja", "ko", "pt", "ru", "zh", "hi"]
+        if target_language not in valid_languages:
+            logger.warning(f"Unsupported language: {target_language}, falling back to English")
+            target_language = "en"
+        
+        translated_segments = translate_text(
+            final_segments, 
+            target_lang=target_language,
+            translation_method="batch"
+        )
+        
+        # Generate subtitle file
         subtitle_file = f"temp/{os.path.basename(video_path).split('.')[0]}_{target_language}.srt"
-        generate_srt_subtitles(translated, subtitle_file)
-
+        generate_srt_subtitles(translated_segments, output_file=subtitle_file)
+        
+        # Step 6: Configure voice characteristics for speakers
         progress(0.6, desc="Configuring voices")
-        unique_speakers = {seg['speaker'] for seg in translated if 'speaker' in seg}
-        voice_config = {}
-        use_xtts = tts_choice == "Voice cloning (XTTS)"
-
-        if use_xtts:
-            ref_files = diarizer.extract_speaker_references(clean_audio, speakers, "reference_audio")
-            for speaker in unique_speakers:
-                if match := re.match(r"SPEAKER_(\d+)", speaker):
-                    spk_id = int(match.group(1))
-                    voice_config[spk_id] = {
-                        'engine': 'xtts' if speaker in ref_files else 'edge_tts',
-                        'reference_audio': ref_files.get(speaker),
-                        'gender': speaker_config.get(str(spk_id), "female"),
-                        'language': target_language
-                    }
+        processing_status[session_id] = {"status": "Configuring voices", "progress": 0.6}
+        
+        # Detect number of unique speakers
+        unique_speakers = set()
+        for segment in translated_segments:
+            if 'speaker' in segment:
+                unique_speakers.add(segment['speaker'])
+        
+        logger.info(f"Detected {len(unique_speakers)} speakers")
+        
+        # Use provided speaker genders
+        use_voice_cloning = tts_choice == "Voice cloning (XTTS)"
+        voice_config = {}  # Map of speaker_id to gender or voice config
+        
+        if use_voice_cloning:
+            # Extract reference audio for voice cloning
+            logger.info("Extracting speaker reference audio for voice cloning...")
+            reference_files = diarizer.extract_speaker_references(
+                clean_audio_path, 
+                speakers, 
+                output_dir="reference_audio"
+            )
+            
+            # Create voice config for XTTS
+            for speaker in sorted(list(unique_speakers)):
+                match = re.search(r'SPEAKER_(\d+)', speaker)
+                if match:
+                    speaker_id = int(match.group(1))
+                    if speaker in reference_files:
+                        voice_config[speaker_id] = {
+                            'engine': 'xtts',
+                            'reference_audio': reference_files[speaker],
+                            'language': target_language  # Use the validated target language
+                        }
+                        logger.info(f"Using voice cloning for Speaker {speaker_id+1} with reference file: {os.path.basename(reference_files[speaker])}")
+                    else:
+                        # Fallback to Edge TTS if no reference audio
+                        logger.warning(f"No reference audio found for Speaker {speaker_id+1}, falling back to Edge TTS")
+                        gender = "female"  # Default fallback
+                        if str(speaker_id) in speaker_genders and speaker_genders[str(speaker_id)]:
+                            gender = speaker_genders[str(speaker_id)]
+                        
+                        voice_config[speaker_id] = {
+                            'engine': 'edge_tts',
+                            'gender': gender
+                        }
         else:
-            for speaker in unique_speakers:
-                if match := re.match(r"SPEAKER_(\d+)", speaker):
-                    spk_id = int(match.group(1))
-                    voice_config[spk_id] = {
-                        'engine': 'edge_tts',
-                        'gender': speaker_config.get(str(spk_id), "female")
-                    }
+            # Standard Edge TTS configuration
+            if len(unique_speakers) > 0:
+                for speaker in sorted(list(unique_speakers)):
+                    match = re.search(r'SPEAKER_(\d+)', speaker)
+                    if match:
+                        speaker_id = int(match.group(1))
+                        gender = "female" if speaker_id % 2 == 0 else "male"  # Default fallback
+                        
+                        # Use selected gender if available
+                        if str(speaker_id) in speaker_genders and speaker_genders[str(speaker_id)]:
+                            gender = speaker_genders[str(speaker_id)]
+                            
+                        voice_config[speaker_id] = gender
+        
+        # Step 7: Generate speech in target language
+        progress(0.7, desc=f"Generating speech in {target_language}")
+        processing_status[session_id] = {"status": f"Generating speech in {target_language}", "progress": 0.7}
+        
+        dubbed_audio_path = generate_tts(translated_segments, target_language, voice_config, output_dir="audio2")
+        
+        # Step 8: Create video with mixed audio
+        progress(0.85, desc="Creating final video")
+        processing_status[session_id] = {"status": "Creating final video", "progress": 0.85}
 
-        progress(0.7, desc="Generating TTS")
-        dubbed_audio = generate_tts(translated, target_language, voice_config, "audio2")
+        # Use consistent output path with session ID
+        output_video_path = os.path.join("temp", f"output_video_{session_id}.mp4")
 
-        progress(0.85, desc="Mixing audio")
-        output_path = create_video_with_mixed_audio(video_path, bg_audio, dubbed_audio)
+        # Pass the correct output path to the function
+        success = create_video_with_mixed_audio(
+            main_video_path=video_path, 
+            background_music_path=bg_audio_path, 
+            main_audio_path=dubbed_audio_path,
+            output_path=output_video_path  # Make sure this parameter exists in your function
+        )
 
+        if not success:
+            raise RuntimeError("Failed to create final video with audio")
+
+        # Verify the output video exists
+        if not os.path.exists(output_video_path):
+            raise FileNotFoundError(f"Output video not found at expected path: {output_video_path}")
+
+        # Make sure we have an absolute path for Gradio/Kaggle
+        absolute_video_path = os.path.abspath(output_video_path)
+        
+        # Complete
+        progress(1.0, desc="Process completed")
         processing_status[session_id] = {"status": "Completed", "progress": 1.0}
+
         return {
-            "video": output_path,
-            "subtitle": subtitle_file,
-            "message": "Processing completed successfully!"
+            "video": absolute_video_path,  # Use absolute path for reliable access
+            "subtitle": os.path.abspath(subtitle_file),  # Also use absolute path here
+            "message": "Process completed successfully!"
         }
         
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.exception("Error in processing pipeline")
         processing_status[session_id] = {"status": f"Error: {str(e)}", "progress": -1}
-        return {
-            "video": None,
-            "subtitle": None,
-            "message": f"Error: {str(e)}"
-        }
+        return {"error": True, "message": f"Error: {str(e)}"}
 
+def get_processing_status(session_id):
+    """Get the current processing status for the given session"""
+    global processing_status
+    if session_id in processing_status:
+        return processing_status[session_id]["status"]
+    return "No status available"
+
+def check_api_tokens():
+    """Check if required API tokens are set"""
+    missing_tokens = []
+    
+    if not os.getenv("HUGGINGFACE_TOKEN"):
+        missing_tokens.append("HUGGINGFACE_TOKEN")
+    
+    if missing_tokens:
+        return f"Warning: Missing API tokens: {', '.join(missing_tokens)}. Please set them in your .env file."
+    else:
+        return "All required API tokens are set."
+
+# Define the Gradio interface
 def create_interface():
-    css = """
-    .loading {
-        display: none;
-        text-align: center;
-        margin: 10px;
-    }
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
-    }
-    .spinner {
-        animation: spin 2s linear infinite;
-        width: 40px;
-        height: 40px;
-        border: 4px solid #f3f3f3;
-        border-top: 4px solid #3498db;
-        border-radius: 50%;
-    }
-    """
-
-    with gr.Blocks(title="SyncDub", theme=gr.themes.Soft(), css=css) as app:
-        gr.Markdown("# SyncDub - Video Translation & Dubbing")
-        session_id = gr.State(create_session_id)
+    with gr.Blocks(title="SyncDub - Video Translation and Dubbing") as app:
+        gr.Markdown("# SyncDub - Video Translation and Dubbing")
+        gr.Markdown("Translate and dub videos to different languages with speaker diarization")
         
-        with gr.Row():
-            with gr.Column():
-                media = gr.Textbox(label="Video URL or File Path")
-                upload = gr.File(label="Upload Video", file_types=["video"])
-                lang = gr.Dropdown(
-                    choices=["en", "es", "fr", "de", "it", "ja", "ko", "pt", "ru", "zh"],
-                    label="Target Language",
-                    value="en"
-                )
-                tts = gr.Radio(
-                    choices=["Simple dubbing (Edge TTS)", "Voice cloning (XTTS)"],
-                    label="TTS Method",
-                    value="Simple dubbing (Edge TTS)"
-                )
-                speakers = gr.Slider(1, 8, value=1, step=1, label="Maximum Speakers")
-                inputs = gr.Column()
-                btn = gr.Button("Start Processing", variant="primary")
-                status = gr.Textbox(label="Status", value="Ready", interactive=False)
-                loading = gr.HTML("""<div class="loading"><div class="spinner"></div></div>""")
-                poll_btn = gr.Button("Poll Status", visible=False)
+        session_id = create_session_id()  # Create a session ID for tracking progress
+        
+        with gr.Tab("Process Video"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    media_input = gr.Textbox(label="Video URL or File Upload", placeholder="Enter a YouTube URL or upload a video file")
+                    
+                    with gr.Row():
+                        # Enhanced language dropdown with full language names
+                        target_language = gr.Dropdown(
+                            choices=[
+                                ("English", "en"), 
+                                ("Spanish", "es"), 
+                                ("French", "fr"), 
+                                ("German", "de"), 
+                                ("Hindi", "hi"),
+                                ("Italian", "it"), 
+                                ("Japanese", "ja"), 
+                                ("Korean", "ko"), 
+                                ("Portuguese", "pt"), 
+                                ("Russian", "ru"), 
+                                ("Chinese", "zh")
+                            ],
+                            label="Target Language",
+                            value="hi"
+                        )
+                        tts_choice = gr.Radio(
+                            choices=["Simple dubbing (Edge TTS)", "Voice cloning (XTTS)"],
+                            label="TTS Method",
+                            value="Simple dubbing (Edge TTS)"
+                        )
+                    
+                    # Speaker count input and update button
+                    with gr.Row():
+                        max_speakers = gr.Textbox(label="Maximum number of speakers", placeholder="Leave blank for auto")
+                        update_speakers_btn = gr.Button("Update Speaker Options")
+                    
+                    # Speaker gender container
+                    with gr.Group(visible=False) as speaker_genders_container:
+                        gr.Markdown("### Speaker Gender Selection")
+                        speaker_genders = {}
+                        for i in range(8):  # Support up to 8 speakers
+                            speaker_genders[str(i)] = gr.Radio(
+                                choices=["male", "female"],
+                                value="male" if i % 2 == 1 else "female",
+                                label=f"Speaker {i} Gender",
+                                visible=False  # Initially hidden
+                            )
+                    
+                    process_btn = gr.Button("Process Video", variant="primary")
+                    status_text = gr.Textbox(label="Status", value="Ready", interactive=False)
+                
+                with gr.Column(scale=3):
+                    output = gr.Video(label="Output Video")
+                    subtitle_output = gr.File(label="Generated Subtitles")
+                    output_message = gr.Textbox(label="Message", interactive=False)
             
-            with gr.Column():
-                video = gr.Video(label="Processed Video")
-                subs = gr.File(label="Generated Subtitles")
-                msg = gr.Textbox(label="Messages")
-
-        def update_inputs(tts_method, spk_count):
-            components = []
-            for i in range(int(spk_count)):
-                if tts_method == "Simple dubbing (Edge TTS)":
-                    components.append(gr.Radio(
-                        ["male", "female"], 
-                        label=f"Speaker {i+1} Gender",
-                        value="female"
-                    ))
-                else:
-                    components.append(gr.File(
-                        label=f"Speaker {i+1} Reference Audio",
-                        file_types=["audio"]
-                    ))
-            return components
-
-        tts.change(update_inputs, [tts, speakers], inputs)
-        speakers.change(update_inputs, [tts, speakers], inputs)
-
-        def wrapper(media_url, media_file, lang, tts, spk, *inputs):
-            session_id.value = create_session_id()
-            source = media_file or media_url
-            config = {}
-            for i, val in enumerate(inputs):
-                if val:  # Only add if value exists
-                    if isinstance(val, dict):  # File input
-                        config[str(i)] = val.get("name", "")
-                    else:  # Radio input
-                        config[str(i)] = val
-            return process_video(source, lang, tts, str(spk), config, session_id.value)
-        
-        # Main processing click
-        btn.click(
-            wrapper,
-            [media, upload, lang, tts, speakers, inputs],
-            [video, subs, msg]
-        )
-
-        # Status polling functions
-        def check_status():
-            return processing_status.get(session_id.value, {}).get("status", "Ready")
-        
-        def toggle_loading(status):
-            show = "Processing" in status or "Initializing" in status
-            return gr.HTML.update(visible=show)
-        
-        def poll_status():
-            current_status = check_status()
-            loading_update = toggle_loading(current_status)
-            return current_status, loading_update
-        
-        # Set up polling
-        poll_btn.click(
-            poll_status,
-            outputs=[status, loading]
-        ).then(
-            lambda: time.sleep(1),
-            None,
-            None,
-            queue=False
-        ).then(
-            lambda: poll_btn.click(),
-            None,
-            None,
-            queue=False
-        )
-
-        # Start polling when processing begins
-        btn.click(
-            lambda: poll_btn.click(),
-            None,
-            None,
-            queue=False
-        )
-
+            # Function to update speaker gender options
+            def update_speaker_options(max_speakers_value):
+                updates = {}
+                
+                try:
+                    num_speakers = int(max_speakers_value) if max_speakers_value.strip() else 0
+                    
+                    if num_speakers > 0:
+                        # Show the speaker gender container
+                        updates[speaker_genders_container] = gr.Group(visible=True)
+                        
+                        # Show only the relevant number of speaker options
+                        for i in range(8):
+                            updates[speaker_genders[str(i)]] = gr.Radio(
+                                visible=(i < num_speakers)
+                            )
+                    else:
+                        # Hide all if no valid number
+                        updates[speaker_genders_container] = gr.Group(visible=False)
+                except ValueError:
+                    # Hide all if invalid number
+                    updates[speaker_genders_container] = gr.Group(visible=False)
+                
+                return updates
+            
+            # Connect the update button to show/hide speaker options
+            update_speakers_btn.click(
+                fn=update_speaker_options,
+                inputs=[max_speakers],
+                outputs=[speaker_genders_container] + [speaker_genders[str(i)] for i in range(8)]
+            )
+            
+            # Updated process_with_genders function for better debugging
+            def process_with_genders(media_source, target_language, tts_choice, max_speakers, *gender_values):
+                # Convert the gender values into a dictionary to pass to process_video
+                speaker_genders_dict = {str(i): gender for i, gender in enumerate(gender_values) if gender}
+                
+                try:
+                    result = process_video(media_source, target_language, tts_choice, max_speakers, 
+                                          speaker_genders_dict, session_id)
+                    
+                    video_path = result.get("video")
+                    subtitle_path = result.get("subtitle")
+                    message = result.get("message", "Process completed")
+                    
+                    # Add debug info
+                    if video_path:
+                        message += f"\nVideo saved at: {video_path}"
+                        message += f"\nFile exists: {os.path.exists(video_path)}"
+                        message += f"\nFile size: {os.path.getsize(video_path)/1024/1024:.2f} MB" if os.path.exists(video_path) else ""
+                    
+                    return video_path, subtitle_path, message
+                    
+                except Exception as e:
+                    import traceback
+                    error_msg = f"Error in processing: {str(e)}\n{traceback.format_exc()}"
+                    print(error_msg)
+                    return None, None, error_msg
+            
+            # Connect the process button
+            process_btn.click(
+                fn=process_with_genders, 
+                inputs=[
+                    media_input, 
+                    target_language, 
+                    tts_choice, 
+                    max_speakers, 
+                    # Pass individual radio components, not a Group
+                    *[speaker_genders[str(i)] for i in range(8)]
+                ],
+                outputs=[output, subtitle_output, output_message]
+            )
+            
+            # Update status periodically
+            status_timer = gr.Timer(2, lambda: get_processing_status(session_id), None, status_text)
+            
+            # Create a more compatible approach for status updates
+            def start_status_updates(session_id):
+                def update_status_thread():
+                    import time
+                    while session_id in processing_status and processing_status[session_id]["progress"] < 1.0:
+                        try:
+                            time.sleep(1)  # Update status every second
+                            # This is a workaround since we can't use JavaScript directly
+                        except:
+                            break
+                
+                thread = threading.Thread(target=update_status_thread)
+                thread.daemon = True  # Thread will exit when main program exits
+                thread.start()
+                return "Processing started"
+            
+            # Manual refresh button as a fallback option
+            refresh_btn = gr.Button("Refresh Status")
+            
+            # Status checking function
+            def check_status(session_id):
+                status = get_processing_status(session_id)
+                return status
+            
+            # Connect the refresh button to check status
+            refresh_btn.click(
+                fn=check_status,
+                inputs=[gr.State(session_id)],
+                outputs=[status_text]
+            )
+            
+            # Create a simple auto-refresh component using a Textbox with a timer
+            gr.HTML("""
+            <script>
+            // Simple poller to update status
+            document.addEventListener('DOMContentLoaded', function() {
+                let refreshInterval;
+                
+                // Look for the primary button (Process Video)
+                const processButton = document.querySelector('button.primary');
+                
+                if (processButton) {
+                    // When process starts, begin polling
+                    processButton.addEventListener('click', function() {
+                        if (refreshInterval) clearInterval(refreshInterval);
+                        
+                        // Find the refresh button
+                        const refreshButtons = Array.from(document.querySelectorAll('button'));
+                        const refreshButton = refreshButtons.find(btn => btn.textContent.includes('Refresh Status'));
+                        
+                        if (refreshButton) {
+                            // Start auto-polling every 2 seconds
+                            refreshInterval = setInterval(function() {
+                                refreshButton.click();
+                            }, 2000);
+                            
+                            // Stop polling after 30 minutes (safety)
+                            setTimeout(function() {
+                                if (refreshInterval) clearInterval(refreshInterval);
+                            }, 30*60*1000);
+                        }
+                    });
+                }
+            });
+            </script>
+            """)
+            
+        with gr.Tab("Help"):
+            gr.Markdown("""
+            ## How to use SyncDub
+            
+            1. **Input**: Enter a YouTube URL or path to a local video file, or upload a video
+            2. **Target Language**: Select the language you want to translate and dub into
+            3. **TTS Engine**: 
+               - **Simple dubbing**: Uses Edge TTS (faster but less natural sounding)
+               - **Voice cloning**: Uses XTTS to clone the original speakers' voices (slower but more natural)
+            4. **Maximum Speakers**: Optionally specify the maximum number of speakers to detect
+            5. **Process**: Click the Process Video button to start
+            
+            ## Requirements
+            
+            Make sure you have the following API tokens in your `.env` file:
+            - `HUGGINGFACE_TOKEN`: Required for speech diarization
+            
+            ## Troubleshooting
+            
+            - If you encounter errors, check that all API tokens are set correctly
+            - For large videos, the process may take several minutes
+            - If voice cloning doesn't sound right, try simple dubbing instead
+            """)
+    
     return app
 
+# Launch the interface
 if __name__ == "__main__":
-    interface = create_interface()
+    app = create_interface()
     
-    # Check if running in Colab or Kaggle
+    # Detect environment
     try:
-        import google.colab
-        is_colab = True
-    except ImportError:
-        is_colab = False
-    
-    # The simplest robust solution: let Gradio find an available port automatically
-    # This works in most environments (local, Kaggle, etc.)
-    try:
-        if is_colab:
-            # For Google Colab, share is important
-            interface.launch(share=True)
+        # Check if running in Kaggle
+        is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
+        
+        if is_kaggle:
+            print("Detected Kaggle environment, using appropriate settings...")
+            app.launch(debug=True, share=True)
         else:
-            # For other environments (Kaggle, local), don't specify a port
-            # Let Gradio automatically find an available one
-            interface.launch(server_name="0.0.0.0", share=True)
+            # For local or Colab environments
+            print("Launching with flexible port settings...")
+            app.launch(server_name="0.0.0.0", share=True)
     except Exception as e:
-        # If there's still an error, report it clearly
-        print(f"Error launching Gradio interface: {str(e)}")
-        print("Trying alternate launch method...")
-        # Fallback to the most basic launch method
-        interface.launch()
+        print(f"Error with specific launch parameters: {str(e)}")
+        print("Falling back to default launch...")
+        # Most basic launch method - should work in most cases
+        app.launch(share=True)

@@ -6,6 +6,7 @@ def create_video_with_mixed_audio(
     main_video_path, 
     background_music_path, 
     main_audio_path, 
+    output_path=None,  # Add output_path parameter for custom output location
     temp_dir="temp",  # Directory for temporary files
     bg_volume=0.3,
     main_audio_volume=1.0
@@ -17,6 +18,7 @@ def create_video_with_mixed_audio(
         main_video_path (str): Path to the main video file
         background_music_path (str): Path to the background music file
         main_audio_path (str): Path to the main audio (dubbed speech)
+        output_path (str, optional): Custom output path for the final video
         temp_dir (str): Directory for temporary files
         bg_volume (float): Volume level for background music (0.0-1.0)
         main_audio_volume (float): Volume level for main audio (0.0-1.0)
@@ -31,7 +33,7 @@ def create_video_with_mixed_audio(
         
         # Define paths for temporary and output files
         temp_audio_path = os.path.join(temp_dir, "mixed_audio.wav")
-        output_video_path = os.path.join(temp_dir, "output_video.mp4")
+        output_video_path = output_path if output_path else os.path.join(temp_dir, "output_video.mp4")
         
         # Step 1: Mix the background audio and main audio with volume control
         print("Step 1: Mixing audio tracks...")
