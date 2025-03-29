@@ -6,6 +6,10 @@ import re
 import gradio as gr
 from dotenv import load_dotenv
 import threading
+import importlib
+import audio_to_video
+importlib.reload(audio_to_video)  # Force reload the module
+from audio_to_video import create_video_with_mixed_audio
 
 # Add the current directory to path to help with imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -18,7 +22,6 @@ from speech_recognition import SpeechRecognizer
 from speech_diarization import SpeakerDiarizer
 from translate import translate_text, generate_srt_subtitles
 from text_to_speech import generate_tts
-from audio_to_video import create_video_with_mixed_audio
 
 # Load environment variables
 load_dotenv()
@@ -191,16 +194,35 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         progress(0.85, desc="Creating final video")
         processing_status[session_id] = {"status": "Creating final video", "progress": 0.85}
 
-        # Use consistent output path with session ID
+        # Create a unique output path for this session
         output_video_path = os.path.join("temp", f"output_video_{session_id}.mp4")
 
-        # Pass the correct output path to the function
-        success = create_video_with_mixed_audio(
-            main_video_path=video_path, 
-            background_music_path=bg_audio_path, 
-            main_audio_path=dubbed_audio_path,
-            output_path=output_video_path  # Make sure this parameter exists in your function
-        )
+        # Check if the function supports output_path parameter
+        import inspect
+        supports_output_path = 'output_path' in inspect.signature(create_video_with_mixed_audio).parameters
+
+        # Call the function with or without the parameter
+        if supports_output_path:
+            success = create_video_with_mixed_audio(
+                main_video_path=video_path, 
+                background_music_path=bg_audio_path, 
+                main_audio_path=dubbed_audio_path,
+                output_path=output_video_path
+            )
+        else:
+            # Fall back to original behavior if parameter isn't supported
+            success = create_video_with_mixed_audio(
+                main_video_path=video_path, 
+                background_music_path=bg_audio_path, 
+                main_audio_path=dubbed_audio_path
+            )
+            
+            # If successful, copy the default output to our session-specific file
+            if success:
+                import shutil
+                default_output = os.path.join("temp", "output_video.mp4")
+                if os.path.exists(default_output):
+                    shutil.copy2(default_output, output_video_path)
 
         if not success:
             raise RuntimeError("Failed to create final video with audio")
