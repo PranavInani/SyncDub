@@ -6,10 +6,7 @@ import re
 import gradio as gr
 from dotenv import load_dotenv
 import threading
-import importlib
-import audio_to_video
-importlib.reload(audio_to_video)  # Force reload the module
-from audio_to_video import create_video_with_mixed_audio
+import shutil
 
 # Add the current directory to path to help with imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,6 +19,7 @@ from speech_recognition import SpeechRecognizer
 from speech_diarization import SpeakerDiarizer
 from translate import translate_text, generate_srt_subtitles
 from text_to_speech import generate_tts
+from audio_to_video import create_video_with_mixed_audio
 
 # Load environment variables
 load_dotenv()
@@ -35,6 +33,7 @@ os.makedirs("temp", exist_ok=True)
 os.makedirs("audio", exist_ok=True)
 os.makedirs("audio2", exist_ok=True)
 os.makedirs("reference_audio", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)  # Add directory for downloadable outputs
 
 # Global variables for process tracking
 processing_status = {}
@@ -44,7 +43,7 @@ def create_session_id():
     import uuid
     return str(uuid.uuid4())[:8]
 
-def process_video(media_source, target_language, tts_choice, max_speakers, speaker_genders, session_id, progress=gr.Progress()):
+def process_video(media_source, target_language, tts_choice, max_speakers, speaker_genders, session_id, translation_method="batch", progress=gr.Progress()):
     """Main processing function that handles the complete pipeline"""
     global processing_status
     processing_status[session_id] = {"status": "Starting", "progress": 0}
@@ -114,7 +113,7 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         translated_segments = translate_text(
             final_segments, 
             target_lang=target_language,
-            translation_method="batch"
+            translation_method=translation_method
         )
         
         # Generate subtitle file
@@ -193,55 +192,41 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         # Step 8: Create video with mixed audio
         progress(0.85, desc="Creating final video")
         processing_status[session_id] = {"status": "Creating final video", "progress": 0.85}
-
-        # Create a unique output path for this session
-        output_video_path = os.path.join("temp", f"output_video_{session_id}.mp4")
-
-        # Check if the function supports output_path parameter
-        import inspect
-        supports_output_path = 'output_path' in inspect.signature(create_video_with_mixed_audio).parameters
-
-        # Call the function with or without the parameter
-        if supports_output_path:
-            success = create_video_with_mixed_audio(
-                main_video_path=video_path, 
-                background_music_path=bg_audio_path, 
-                main_audio_path=dubbed_audio_path,
-                output_path=output_video_path
-            )
-        else:
-            # Fall back to original behavior if parameter isn't supported
-            success = create_video_with_mixed_audio(
-                main_video_path=video_path, 
-                background_music_path=bg_audio_path, 
-                main_audio_path=dubbed_audio_path
-            )
-            
-            # If successful, copy the default output to our session-specific file
-            if success:
-                import shutil
-                default_output = os.path.join("temp", "output_video.mp4")
-                if os.path.exists(default_output):
-                    shutil.copy2(default_output, output_video_path)
-
+        
+        success = create_video_with_mixed_audio(
+            main_video_path=video_path, 
+            background_music_path=bg_audio_path, 
+            main_audio_path=dubbed_audio_path
+        )
+        
         if not success:
             raise RuntimeError("Failed to create final video with audio")
-
+        
+        # Use known output path since function returns boolean
+        output_video_path = os.path.join("temp", "output_video.mp4")
+        
         # Verify the output video exists
         if not os.path.exists(output_video_path):
             raise FileNotFoundError(f"Output video not found at expected path: {output_video_path}")
-
-        # Make sure we have an absolute path for Gradio/Kaggle
-        absolute_video_path = os.path.abspath(output_video_path)
         
+        # Create downloadable copies with unique names
+        file_basename = os.path.basename(video_path).split('.')[0]
+        downloadable_video = f"outputs/{file_basename}_{target_language}_{session_id}.mp4"
+        downloadable_subtitle = f"outputs/{file_basename}_{target_language}_{session_id}.srt"
+        
+        # Copy files to outputs directory for download
+        shutil.copy2(output_video_path, downloadable_video)
+        shutil.copy2(subtitle_file, downloadable_subtitle)
+            
         # Complete
         progress(1.0, desc="Process completed")
         processing_status[session_id] = {"status": "Completed", "progress": 1.0}
-
+        
         return {
-            "video": absolute_video_path,  # Use absolute path for reliable access
-            "subtitle": os.path.abspath(subtitle_file),  # Also use absolute path here
-            "message": "Process completed successfully!"
+            "error": False,
+            "video": downloadable_video,
+            "subtitle": downloadable_subtitle,
+            "message": "Process completed successfully! Click on the files to download."
         }
         
     except Exception as e:
@@ -306,6 +291,15 @@ def create_interface():
                             value="Simple dubbing (Edge TTS)"
                         )
                     
+                    # Add translation method selection
+                    with gr.Row():
+                        translation_method = gr.Radio(
+                            choices=["batch", "iterative", "groq"],
+                            label="Translation Method",
+                            value="batch",
+                            info="Batch: Faster for longer content. Iterative: May be more accurate for short content. Groq: Uses Groq LLM API."
+                        )
+                    
                     # Speaker count input and update button
                     with gr.Row():
                         max_speakers = gr.Textbox(label="Maximum number of speakers", placeholder="Leave blank for auto")
@@ -327,9 +321,12 @@ def create_interface():
                     status_text = gr.Textbox(label="Status", value="Ready", interactive=False)
                 
                 with gr.Column(scale=3):
-                    output = gr.Video(label="Output Video")
-                    subtitle_output = gr.File(label="Generated Subtitles")
-                    output_message = gr.Textbox(label="Message", interactive=False)
+                    # Replace video display with file downloads
+                    gr.Markdown("### Output Files")
+                    output_message = gr.Textbox(label="Status", interactive=False)
+                    with gr.Row():
+                        output = gr.File(label="Download Video")
+                        subtitle_output = gr.File(label="Download Subtitles")
             
             # Function to update speaker gender options
             def update_speaker_options(max_speakers_value):
@@ -363,32 +360,18 @@ def create_interface():
                 outputs=[speaker_genders_container] + [speaker_genders[str(i)] for i in range(8)]
             )
             
-            # Updated process_with_genders function for better debugging
-            def process_with_genders(media_source, target_language, tts_choice, max_speakers, *gender_values):
+            # Function to actually pass the gender values to the process_video function
+            def process_with_genders(media_source, target_language, tts_choice, max_speakers, translation_method, *gender_values):
                 # Convert the gender values into a dictionary to pass to process_video
                 speaker_genders_dict = {str(i): gender for i, gender in enumerate(gender_values) if gender}
+                result = process_video(media_source, target_language, tts_choice, max_speakers, 
+                                      speaker_genders_dict, session_id, translation_method=translation_method)
                 
-                try:
-                    result = process_video(media_source, target_language, tts_choice, max_speakers, 
-                                          speaker_genders_dict, session_id)
-                    
-                    video_path = result.get("video")
-                    subtitle_path = result.get("subtitle")
-                    message = result.get("message", "Process completed")
-                    
-                    # Add debug info
-                    if video_path:
-                        message += f"\nVideo saved at: {video_path}"
-                        message += f"\nFile exists: {os.path.exists(video_path)}"
-                        message += f"\nFile size: {os.path.getsize(video_path)/1024/1024:.2f} MB" if os.path.exists(video_path) else ""
-                    
-                    return video_path, subtitle_path, message
-                    
-                except Exception as e:
-                    import traceback
-                    error_msg = f"Error in processing: {str(e)}\n{traceback.format_exc()}"
-                    print(error_msg)
-                    return None, None, error_msg
+                # Return the output values based on whether there was an error
+                if result.get("error", False):
+                    return None, None, result.get("message", "An error occurred")
+                else:
+                    return result.get("video"), result.get("subtitle"), result.get("message")
             
             # Connect the process button
             process_btn.click(
@@ -397,7 +380,8 @@ def create_interface():
                     media_input, 
                     target_language, 
                     tts_choice, 
-                    max_speakers, 
+                    max_speakers,
+                    translation_method,  # Add translation method to inputs
                     # Pass individual radio components, not a Group
                     *[speaker_genders[str(i)] for i in range(8)]
                 ],
@@ -484,7 +468,8 @@ def create_interface():
                - **Simple dubbing**: Uses Edge TTS (faster but less natural sounding)
                - **Voice cloning**: Uses XTTS to clone the original speakers' voices (slower but more natural)
             4. **Maximum Speakers**: Optionally specify the maximum number of speakers to detect
-            5. **Process**: Click the Process Video button to start
+            5. **Translation Method**: Choose the translation method (Batch, Iterative, or Groq)
+            6. **Process**: Click the Process Video button to start
             
             ## Requirements
             
@@ -503,21 +488,4 @@ def create_interface():
 # Launch the interface
 if __name__ == "__main__":
     app = create_interface()
-    
-    # Detect environment
-    try:
-        # Check if running in Kaggle
-        is_kaggle = os.environ.get('KAGGLE_KERNEL_RUN_TYPE') is not None
-        
-        if is_kaggle:
-            print("Detected Kaggle environment, using appropriate settings...")
-            app.launch(debug=True, share=True)
-        else:
-            # For local or Colab environments
-            print("Launching with flexible port settings...")
-            app.launch(server_name="0.0.0.0", share=True)
-    except Exception as e:
-        print(f"Error with specific launch parameters: {str(e)}")
-        print("Falling back to default launch...")
-        # Most basic launch method - should work in most cases
-        app.launch(share=True)
+    app.launch(share=True)
