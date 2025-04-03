@@ -325,9 +325,9 @@ def create_interface():
         gr.Markdown("# SyncDub - Video Translation and Dubbing")
         gr.Markdown("Translate and dub videos to different languages with speaker diarization")
         
-        # Create a function to generate a new session ID for each process
-        def get_new_session_id():
-            return create_session_id()
+        # Initialize a default session ID and create a State component to track it
+        current_session_id = create_session_id()
+        session_id_state = gr.State(value=current_session_id)
         
         with gr.Tab("Process Video"):
             with gr.Row():
@@ -429,21 +429,21 @@ def create_interface():
                 outputs=[speaker_genders_container] + [speaker_genders[str(i)] for i in range(8)]
             )
             
-            # Function to process with genders and a NEW session ID each time
+            # Update the process_with_genders function
             def process_with_genders(media_source, target_language, tts_choice, max_speakers, translation_method, *gender_values):
                 # Generate a new session ID for each processing request
-                current_session_id = create_session_id()
+                new_session_id = create_session_id()
                 
                 # Convert the gender values into a dictionary to pass to process_video
                 speaker_genders_dict = {str(i): gender for i, gender in enumerate(gender_values) if gender}
                 result = process_video(media_source, target_language, tts_choice, max_speakers, 
-                                      speaker_genders_dict, current_session_id, translation_method=translation_method)
+                                      speaker_genders_dict, new_session_id, translation_method=translation_method)
                 
-                # Return the output values based on whether there was an error
+                # Return the output values and update the session ID state
                 if result.get("error", False):
-                    return None, None, result.get("message", "An error occurred")
+                    return new_session_id, None, None, result.get("message", "An error occurred")
                 else:
-                    return result.get("video"), result.get("subtitle"), result.get("message")
+                    return new_session_id, result.get("video"), result.get("subtitle"), result.get("message")
             
             # Connect the process button
             process_btn.click(
@@ -453,11 +453,10 @@ def create_interface():
                     target_language, 
                     tts_choice, 
                     max_speakers,
-                    translation_method,  # Add translation method to inputs
-                    # Pass individual radio components, not a Group
+                    translation_method,
                     *[speaker_genders[str(i)] for i in range(8)]
                 ],
-                outputs=[output, subtitle_output, output_message]
+                outputs=[session_id_state, output, subtitle_output, output_message]
             )
             
             # Connect the reset button
@@ -468,7 +467,7 @@ def create_interface():
             )
             
             # Update status periodically
-            status_timer = gr.Timer(2, lambda: get_processing_status(session_id), None, status_text)
+            status_timer = gr.Timer(2, lambda: get_processing_status(session_id_state.value), None, status_text)
             
             # Create a more compatible approach for status updates
             def start_status_updates(session_id):
@@ -494,10 +493,10 @@ def create_interface():
                 status = get_processing_status(session_id)
                 return status
             
-            # Connect the refresh button to check status
+            # Connect the refresh button to check status using the current session ID state
             refresh_btn.click(
                 fn=check_status,
-                inputs=[gr.State(session_id)],
+                inputs=[session_id_state],  # Use the state component
                 outputs=[status_text]
             )
             
