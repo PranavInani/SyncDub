@@ -48,6 +48,17 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
     global processing_status
     processing_status[session_id] = {"status": "Starting", "progress": 0}
     
+    # Create session-specific directories
+    session_dir = os.path.join("temp", session_id)
+    session_audio_dir = os.path.join(session_dir, "audio")
+    session_audio2_dir = os.path.join(session_dir, "audio2") 
+    session_ref_dir = os.path.join(session_dir, "reference_audio")
+    session_output_dir = os.path.join("outputs", session_id)
+    
+    # Create all directories
+    for directory in [session_dir, session_audio_dir, session_audio2_dir, session_ref_dir, session_output_dir]:
+        os.makedirs(directory, exist_ok=True)
+    
     try:
         # Get API tokens
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
@@ -58,11 +69,11 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         # Determine if input is URL or file
         is_url = media_source.startswith(("http://", "https://"))
         
-        # Initialize components
+        # Initialize components with session-specific directories
         progress(0.05, desc="Initializing components")
         processing_status[session_id] = {"status": "Initializing components", "progress": 0.05}
         
-        ingester = MediaIngester(output_dir="temp")
+        ingester = MediaIngester(output_dir=session_dir)
         recognizer = SpeechRecognizer(model_size="base")
         diarizer = SpeakerDiarizer(hf_token=hf_token)
         
@@ -116,8 +127,8 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
             translation_method=translation_method
         )
         
-        # Generate subtitle file
-        subtitle_file = f"temp/{os.path.basename(video_path).split('.')[0]}_{target_language}.srt"
+        # Generate subtitle file - use session directory
+        subtitle_file = f"{session_dir}/{os.path.basename(video_path).split('.')[0]}_{target_language}.srt"
         generate_srt_subtitles(translated_segments, output_file=subtitle_file)
         
         # Step 6: Configure voice characteristics for speakers
@@ -137,12 +148,12 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         voice_config = {}  # Map of speaker_id to gender or voice config
         
         if use_voice_cloning:
-            # Extract reference audio for voice cloning
+            # Extract reference audio for voice cloning - use session directory
             logger.info("Extracting speaker reference audio for voice cloning...")
             reference_files = diarizer.extract_speaker_references(
                 clean_audio_path, 
                 speakers, 
-                output_dir="reference_audio"
+                output_dir=session_ref_dir
             )
             
             # Create voice config for XTTS
@@ -183,36 +194,36 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
                             
                         voice_config[speaker_id] = gender
         
-        # Step 7: Generate speech in target language
+        # Step 7: Generate speech in target language - use session directory
         progress(0.7, desc=f"Generating speech in {target_language}")
         processing_status[session_id] = {"status": f"Generating speech in {target_language}", "progress": 0.7}
         
-        dubbed_audio_path = generate_tts(translated_segments, target_language, voice_config, output_dir="audio2")
+        dubbed_audio_path = generate_tts(translated_segments, target_language, voice_config, output_dir=session_audio2_dir)
         
-        # Step 8: Create video with mixed audio
+        # Step 8: Create video with mixed audio - use session directory for temp and output
         progress(0.85, desc="Creating final video")
         processing_status[session_id] = {"status": "Creating final video", "progress": 0.85}
         
+        output_video_path = os.path.join(session_dir, "output_video.mp4")
         success = create_video_with_mixed_audio(
             main_video_path=video_path, 
             background_music_path=bg_audio_path, 
-            main_audio_path=dubbed_audio_path
+            main_audio_path=dubbed_audio_path,
+            output_path=output_video_path,
+            temp_dir=session_dir
         )
         
         if not success:
             raise RuntimeError("Failed to create final video with audio")
         
-        # Use known output path since function returns boolean
-        output_video_path = os.path.join("temp", "output_video.mp4")
-        
         # Verify the output video exists
         if not os.path.exists(output_video_path):
             raise FileNotFoundError(f"Output video not found at expected path: {output_video_path}")
         
-        # Create downloadable copies with unique names
+        # Create downloadable copies with unique names in session output directory
         file_basename = os.path.basename(video_path).split('.')[0]
-        downloadable_video = f"outputs/{file_basename}_{target_language}_{session_id}.mp4"
-        downloadable_subtitle = f"outputs/{file_basename}_{target_language}_{session_id}.srt"
+        downloadable_video = f"{session_output_dir}/{file_basename}_{target_language}.mp4"
+        downloadable_subtitle = f"{session_output_dir}/{file_basename}_{target_language}.srt"
         
         # Copy files to outputs directory for download
         shutil.copy2(output_video_path, downloadable_video)
