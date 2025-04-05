@@ -45,26 +45,68 @@ def create_session_id():
 
 def reset_application():
     """
-    Reset the application state by clearing temporary files and directories
-    and returning empty/default values for UI components
+    Reset the application state by thoroughly cleaning all temporary files and directories
     """
-    # Directories to clear
-    directories_to_clear = ["temp", "audio", "audio2", "reference_audio"]
+    import os
+    import shutil
+    import time
+    
+    # Directories to completely clean
+    directories_to_clean = ["temp", "audio", "audio2", "reference_audio", "outputs"]
     
     try:
-        # Clear temporary directories
-        for directory in directories_to_clear:
+        # First attempt - delete individual files
+        for directory in directories_to_clean:
             if os.path.exists(directory):
+                logger.info(f"Cleaning directory: {directory}")
                 for filename in os.listdir(directory):
                     file_path = os.path.join(directory, filename)
                     try:
                         if os.path.isfile(file_path):
                             os.unlink(file_path)
+                            logger.info(f"Deleted file: {file_path}")
                         elif os.path.isdir(file_path):
                             shutil.rmtree(file_path)
+                            logger.info(f"Deleted subdirectory: {file_path}")
                     except Exception as e:
                         logger.warning(f"Failed to delete {file_path}: {e}")
+                        
+        # Double-check if any files remain (for stubborn files)
+        for directory in directories_to_clean:
+            if os.path.exists(directory) and any(os.scandir(directory)):
+                # Try more aggressive approach - recreate the directory
+                try:
+                    # Rename the old directory
+                    temp_dir = f"{directory}_old_{int(time.time())}"
+                    os.rename(directory, temp_dir)
+                    # Create a new empty directory
+                    os.makedirs(directory, exist_ok=True)
+                    # Try to remove the old directory in background
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass  # Ignore if we can't delete it immediately
+                except Exception as e:
+                    logger.warning(f"Failed to recreate directory {directory}: {e}")
         
+        # Clear out individual files that might be in the root directory
+        root_files_to_check = [
+            "dubbed_conversation.wav", 
+            "downloaded_video.mp4",
+            "downloaded_video_hi.srt",
+            "extracted_audio.wav",
+            "mixed_audio.wav",
+            "output_video.mp4"
+        ]
+        
+        for filename in root_files_to_check:
+            if os.path.exists(filename):
+                try:
+                    os.unlink(filename)
+                    logger.info(f"Deleted root file: {filename}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete root file {filename}: {e}")
+                        
         # Reset the global processing status
         global processing_status
         processing_status = {}
@@ -72,20 +114,24 @@ def reset_application():
         # Generate a new session ID
         new_session_id = create_session_id()
         
-        # Return values to update UI components (in the order they appear in outputs)
+        # For visual confirmation to the user, return timestamp of the reset
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        success_message = f"⚠️ Application reset complete at {timestamp}. All temporary files cleared. Ready for new processing."
+        
         return {
-            "new_status": "Application reset successful. Ready for new video processing.",
+            "new_status": success_message,
             "session_id": new_session_id,
-            "media_input": "",  # Clear media input field
-            "output": None,     # Clear output file
-            "subtitle": None,   # Clear subtitle file
-            "message": ""       # Clear output message
+            "media_input": None,  # Clear media input field
+            "output": None,       # Clear output file
+            "subtitle": None,     # Clear subtitle file
+            "message": ""         # Clear output message
         }
         
     except Exception as e:
         logger.exception("Error during application reset")
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
         return {
-            "new_status": f"Reset failed: {str(e)}",
+            "new_status": f"⚠️ Reset attempted at {timestamp} but encountered errors: {str(e)}",
             "session_id": None,
             "media_input": None,
             "output": None,
@@ -303,6 +349,35 @@ def check_api_tokens():
     else:
         return "All required API tokens are set."
 
+def check_system_state():
+    """
+    Check the state of all directories and report what files still exist
+    """
+    import os
+    
+    # Directories to check
+    directories_to_check = ["temp", "audio", "audio2", "reference_audio", "outputs"]
+    report = []
+    
+    for directory in directories_to_check:
+        if os.path.exists(directory):
+            files = os.listdir(directory)
+            if files:
+                report.append(f"Directory '{directory}' contains {len(files)} files: {', '.join(files[:5])}")
+                if len(files) > 5:
+                    report.append(f"... and {len(files) - 5} more files")
+            else:
+                report.append(f"Directory '{directory}' is empty")
+        else:
+            report.append(f"Directory '{directory}' does not exist")
+    
+    # Check root files
+    root_files = [f for f in os.listdir('.') if os.path.isfile(f)]
+    if root_files:
+        report.append(f"Root directory contains {len(root_files)} files")
+    
+    return "\n".join(report)
+
 # Define the Gradio interface
 def create_interface():
     with gr.Blocks(title="SyncDub - Video Translation and Dubbing") as app:
@@ -472,16 +547,19 @@ def create_interface():
                 outputs=[status_text]
             )
             
-            # Add the reset button in a row with the refresh button
+            # Make the reset button more visually distinctive
             with gr.Row():
-                reset_btn = gr.Button("Reset Application", variant="secondary")
+                refresh_btn = gr.Button("Refresh Status")
+                reset_btn = gr.Button("🗑️ Reset Everything", variant="stop")
             
             # Connect the reset button with proper handling of return values
             def handle_reset():
                 result = reset_application()
+                # Force refresh of the UI
+                gr.Info("Resetting application...")
                 # Return values in the order expected by the outputs list
                 return (
-                    result["new_status"],
+                    result["new_status"], 
                     result["media_input"],
                     result["output"],
                     result["subtitle"],
@@ -535,6 +613,13 @@ def create_interface():
             });
             </script>
             """)
+            
+            # Add a debug button to the interface
+            with gr.Row():
+                check_btn = gr.Button("Check System State", variant="secondary")
+                check_output = gr.Textbox(label="System State")
+
+            check_btn.click(fn=check_system_state, inputs=[], outputs=[check_output])
             
         with gr.Tab("Help"):
             gr.Markdown("""
