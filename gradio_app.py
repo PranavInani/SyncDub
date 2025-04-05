@@ -43,42 +43,60 @@ def create_session_id():
     import uuid
     return str(uuid.uuid4())[:8]
 
-def clean_session_directory(session_id):
-    """Completely remove and recreate a session directory"""
-    session_dir = os.path.join("temp", session_id)
-    session_output_dir = os.path.join("outputs", session_id)
+def reset_application():
+    """
+    Reset the application state by clearing temporary files and directories
+    and returning empty/default values for UI components
+    """
+    # Directories to clear
+    directories_to_clear = ["temp", "audio", "audio2", "reference_audio"]
     
-    # Remove directories if they exist
-    for dir_path in [session_dir, session_output_dir]:
-        if os.path.exists(dir_path):
-            try:
-                shutil.rmtree(dir_path)
-                logger.info(f"Cleaned directory: {dir_path}")
-            except Exception as e:
-                logger.error(f"Error cleaning directory {dir_path}: {e}")
-    
-    # Recreate empty directories
-    for dir_path in [session_dir, session_output_dir]:
-        os.makedirs(dir_path, exist_ok=True)
+    try:
+        # Clear temporary directories
+        for directory in directories_to_clear:
+            if os.path.exists(directory):
+                for filename in os.listdir(directory):
+                    file_path = os.path.join(directory, filename)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.unlink(file_path)
+                        elif os.path.isdir(file_path):
+                            shutil.rmtree(file_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {file_path}: {e}")
+        
+        # Reset the global processing status
+        global processing_status
+        processing_status = {}
+        
+        # Generate a new session ID
+        new_session_id = create_session_id()
+        
+        # Return values to update UI components (in the order they appear in outputs)
+        return {
+            "new_status": "Application reset successful. Ready for new video processing.",
+            "session_id": new_session_id,
+            "media_input": "",  # Clear media input field
+            "output": None,     # Clear output file
+            "subtitle": None,   # Clear subtitle file
+            "message": ""       # Clear output message
+        }
+        
+    except Exception as e:
+        logger.exception("Error during application reset")
+        return {
+            "new_status": f"Reset failed: {str(e)}",
+            "session_id": None,
+            "media_input": None,
+            "output": None,
+            "subtitle": None,
+            "message": ""
+        }
 
 def process_video(media_source, target_language, tts_choice, max_speakers, speaker_genders, session_id, translation_method="batch", progress=gr.Progress()):
     """Main processing function that handles the complete pipeline"""
     global processing_status
     processing_status[session_id] = {"status": "Starting", "progress": 0}
-    
-    # Clean any existing session data
-    clean_session_directory(session_id)
-    
-    # Create session-specific directories
-    session_dir = os.path.join("temp", session_id)
-    session_audio_dir = os.path.join(session_dir, "audio")
-    session_audio2_dir = os.path.join(session_dir, "audio2") 
-    session_ref_dir = os.path.join(session_dir, "reference_audio")
-    session_output_dir = os.path.join("outputs", session_id)
-    
-    # Create all directories
-    for directory in [session_dir, session_audio_dir, session_audio2_dir, session_ref_dir, session_output_dir]:
-        os.makedirs(directory, exist_ok=True)
     
     try:
         # Get API tokens
@@ -90,11 +108,11 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         # Determine if input is URL or file
         is_url = media_source.startswith(("http://", "https://"))
         
-        # Initialize components with session-specific directories
+        # Initialize components
         progress(0.05, desc="Initializing components")
         processing_status[session_id] = {"status": "Initializing components", "progress": 0.05}
         
-        ingester = MediaIngester(output_dir=session_dir)
+        ingester = MediaIngester(output_dir="temp")
         recognizer = SpeechRecognizer(model_size="base")
         diarizer = SpeakerDiarizer(hf_token=hf_token)
         
@@ -148,8 +166,8 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
             translation_method=translation_method
         )
         
-        # Generate subtitle file - use session directory
-        subtitle_file = f"{session_dir}/{os.path.basename(video_path).split('.')[0]}_{target_language}.srt"
+        # Generate subtitle file
+        subtitle_file = f"temp/{os.path.basename(video_path).split('.')[0]}_{target_language}.srt"
         generate_srt_subtitles(translated_segments, output_file=subtitle_file)
         
         # Step 6: Configure voice characteristics for speakers
@@ -169,12 +187,12 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
         voice_config = {}  # Map of speaker_id to gender or voice config
         
         if use_voice_cloning:
-            # Extract reference audio for voice cloning - use session directory
+            # Extract reference audio for voice cloning
             logger.info("Extracting speaker reference audio for voice cloning...")
             reference_files = diarizer.extract_speaker_references(
                 clean_audio_path, 
                 speakers, 
-                output_dir=session_ref_dir
+                output_dir="reference_audio"
             )
             
             # Create voice config for XTTS
@@ -215,61 +233,36 @@ def process_video(media_source, target_language, tts_choice, max_speakers, speak
                             
                         voice_config[speaker_id] = gender
         
-        # Step 7: Generate speech in target language - use session directory
+        # Step 7: Generate speech in target language
         progress(0.7, desc=f"Generating speech in {target_language}")
         processing_status[session_id] = {"status": f"Generating speech in {target_language}", "progress": 0.7}
         
-        dubbed_audio_path = generate_tts(translated_segments, target_language, voice_config, output_dir=session_audio2_dir)
+        dubbed_audio_path = generate_tts(translated_segments, target_language, voice_config, output_dir="audio2")
         
-        # Step 8: Create video with mixed audio - use session directory for temp and output
+        # Step 8: Create video with mixed audio
         progress(0.85, desc="Creating final video")
         processing_status[session_id] = {"status": "Creating final video", "progress": 0.85}
         
-        output_video_path = os.path.join(session_dir, "output_video.mp4")
         success = create_video_with_mixed_audio(
             main_video_path=video_path, 
             background_music_path=bg_audio_path, 
-            main_audio_path=dubbed_audio_path,
-            output_path=output_video_path,
-            temp_dir=session_dir
+            main_audio_path=dubbed_audio_path
         )
         
         if not success:
             raise RuntimeError("Failed to create final video with audio")
         
+        # Use known output path since function returns boolean
+        output_video_path = os.path.join("temp", "output_video.mp4")
+        
         # Verify the output video exists
         if not os.path.exists(output_video_path):
             raise FileNotFoundError(f"Output video not found at expected path: {output_video_path}")
         
-        # Create downloadable copies with unique names in session output directory
-        if is_url:
-            # For URLs, extract a more meaningful name
-            import urllib.parse
-            parsed_url = urllib.parse.urlparse(media_source)
-            url_path = parsed_url.path
-            
-            # Extract meaningful parts from the URL
-            if "youtube" in media_source.lower() or "youtu.be" in media_source.lower():
-                # Try to extract YouTube video ID
-                match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', media_source)
-                if match:
-                    file_basename = f"youtube_{match.group(1)}"
-                else:
-                    file_basename = "youtube_video"
-            else:
-                # Use the last part of the URL path as basename
-                file_basename = os.path.basename(url_path)
-                if not file_basename:
-                    file_basename = f"url_video_{session_id}"
-        else:
-            # For local files, use the original filename
-            file_basename = os.path.basename(video_path).split('.')[0]
-        
-        # Add timestamp for extra uniqueness
-        import time
-        timestamp = str(int(time.time()))[-6:]
-        downloadable_video = f"{session_output_dir}/{file_basename}_{target_language}_{timestamp}.mp4"
-        downloadable_subtitle = f"{session_output_dir}/{file_basename}_{target_language}_{timestamp}.srt"
+        # Create downloadable copies with unique names
+        file_basename = os.path.basename(video_path).split('.')[0]
+        downloadable_video = f"outputs/{file_basename}_{target_language}_{session_id}.mp4"
+        downloadable_subtitle = f"outputs/{file_basename}_{target_language}_{session_id}.srt"
         
         # Copy files to outputs directory for download
         shutil.copy2(output_video_path, downloadable_video)
@@ -310,24 +303,13 @@ def check_api_tokens():
     else:
         return "All required API tokens are set."
 
-def reset_outputs():
-    """Clear previous outputs"""
-    # Generate a new session ID and clear status
-    session_id = create_session_id()
-    if session_id in processing_status:
-        del processing_status[session_id]
-    
-    return None, None, "Ready for new processing"
-
 # Define the Gradio interface
 def create_interface():
     with gr.Blocks(title="SyncDub - Video Translation and Dubbing") as app:
         gr.Markdown("# SyncDub - Video Translation and Dubbing")
         gr.Markdown("Translate and dub videos to different languages with speaker diarization")
         
-        # Initialize a default session ID and create a State component to track it
-        current_session_id = create_session_id()
-        session_id_state = gr.State(value=current_session_id)
+        session_id = create_session_id()  # Create a session ID for tracking progress
         
         with gr.Tab("Process Video"):
             with gr.Row():
@@ -386,7 +368,6 @@ def create_interface():
                             )
                     
                     process_btn = gr.Button("Process Video", variant="primary")
-                    reset_btn = gr.Button("Reset & Start Fresh", variant="secondary")
                     status_text = gr.Textbox(label="Status", value="Ready", interactive=False)
                 
                 with gr.Column(scale=3):
@@ -429,21 +410,18 @@ def create_interface():
                 outputs=[speaker_genders_container] + [speaker_genders[str(i)] for i in range(8)]
             )
             
-            # Update the process_with_genders function
+            # Function to actually pass the gender values to the process_video function
             def process_with_genders(media_source, target_language, tts_choice, max_speakers, translation_method, *gender_values):
-                # Generate a new session ID for each processing request
-                new_session_id = create_session_id()
-                
                 # Convert the gender values into a dictionary to pass to process_video
                 speaker_genders_dict = {str(i): gender for i, gender in enumerate(gender_values) if gender}
                 result = process_video(media_source, target_language, tts_choice, max_speakers, 
-                                      speaker_genders_dict, new_session_id, translation_method=translation_method)
+                                      speaker_genders_dict, session_id, translation_method=translation_method)
                 
-                # Return the output values and update the session ID state
+                # Return the output values based on whether there was an error
                 if result.get("error", False):
-                    return new_session_id, None, None, result.get("message", "An error occurred")
+                    return None, None, result.get("message", "An error occurred")
                 else:
-                    return new_session_id, result.get("video"), result.get("subtitle"), result.get("message")
+                    return result.get("video"), result.get("subtitle"), result.get("message")
             
             # Connect the process button
             process_btn.click(
@@ -453,21 +431,15 @@ def create_interface():
                     target_language, 
                     tts_choice, 
                     max_speakers,
-                    translation_method,
+                    translation_method,  # Add translation method to inputs
+                    # Pass individual radio components, not a Group
                     *[speaker_genders[str(i)] for i in range(8)]
                 ],
-                outputs=[session_id_state, output, subtitle_output, output_message]
-            )
-            
-            # Connect the reset button
-            reset_btn.click(
-                fn=reset_outputs,
-                inputs=[],
                 outputs=[output, subtitle_output, output_message]
             )
             
             # Update status periodically
-            status_timer = gr.Timer(2, lambda: get_processing_status(session_id_state.value), None, status_text)
+            status_timer = gr.Timer(2, lambda: get_processing_status(session_id), None, status_text)
             
             # Create a more compatible approach for status updates
             def start_status_updates(session_id):
@@ -493,11 +465,39 @@ def create_interface():
                 status = get_processing_status(session_id)
                 return status
             
-            # Connect the refresh button to check status using the current session ID state
+            # Connect the refresh button to check status
             refresh_btn.click(
                 fn=check_status,
-                inputs=[session_id_state],  # Use the state component
+                inputs=[gr.State(session_id)],
                 outputs=[status_text]
+            )
+            
+            # Add the reset button in a row with the refresh button
+            with gr.Row():
+                reset_btn = gr.Button("Reset Application", variant="secondary")
+            
+            # Connect the reset button with proper handling of return values
+            def handle_reset():
+                result = reset_application()
+                # Return values in the order expected by the outputs list
+                return (
+                    result["new_status"],
+                    result["media_input"],
+                    result["output"],
+                    result["subtitle"],
+                    result["message"]
+                )
+            
+            reset_btn.click(
+                fn=handle_reset,
+                inputs=[],
+                outputs=[
+                    status_text,
+                    media_input,
+                    output,
+                    subtitle_output,
+                    output_message
+                ]
             )
             
             # Create a simple auto-refresh component using a Textbox with a timer
@@ -567,31 +567,3 @@ def create_interface():
 if __name__ == "__main__":
     app = create_interface()
     app.launch(share=True)
-
-def download_from_url(self, url):
-    """Download media from URL (including YouTube) with unique filename"""
-    # Generate a unique ID for this download using timestamp
-    import time
-    unique_id = str(int(time.time()))[-6:]  # Last 6 digits of timestamp
-    
-    # Extract video ID from URL to make filename more meaningful
-    import re
-    video_id = "video"
-    if "youtube" in url.lower() or "youtu.be" in url.lower():
-        # Try to extract YouTube video ID
-        match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
-        if match:
-            video_id = match.group(1)
-    
-    # Create unique output path
-    output_path = os.path.join(self.output_dir, f"{video_id}_{unique_id}.mp4")
-    
-    # Force download by adding --no-cache-dir flag
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]',
-        'outtmpl': output_path,
-        'noplaylist': True,
-        'no_cache_dir': True,  # Force not using cache
-    }
-    
-    # Rest of your code...
